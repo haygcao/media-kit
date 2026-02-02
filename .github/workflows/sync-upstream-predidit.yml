@@ -1,0 +1,86 @@
+name: Sync upstream and predidit
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # daily at 03:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure remotes
+        run: |
+          git remote add upstream https://github.com/media-kit/media-kit.git || true
+          git remote add predidit https://github.com/Predidit/media-kit.git || true
+          git fetch --all
+
+      - name: Create sync branch
+        id: branch
+        run: |
+          BRANCH=sync/upstream-predidit-$(date +"%Y%m%d%H%M%S")
+          echo "BRANCH=$BRANCH" >> $GITHUB_OUTPUT
+          git checkout -b "$BRANCH"
+
+      - name: Attempt merge upstream/main
+        id: merge_upstream
+        run: |
+          set -euo pipefail
+          if git merge --no-commit --no-ff upstream/main; then
+            git commit -m "Merge upstream/main"
+            echo "merged=true" >> $GITHUB_OUTPUT
+          else
+            echo "merged=false" >> $GITHUB_OUTPUT
+            echo "conflict=upstream" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Attempt merge predidit/main (only if upstream merged)
+        id: merge_predidit
+        if: steps.merge_upstream.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          if git merge --no-commit --no-ff predidit/main; then
+            git commit -m "Merge predidit/main"
+            echo "pred_merged=true" >> $GITHUB_OUTPUT
+          else
+            echo "pred_merged=false" >> $GITHUB_OUTPUT
+            echo "conflict=predidit" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Push branch
+        if: steps.merge_upstream.outputs.merged == 'true'
+        run: |
+          git push origin HEAD:$BRANCH
+
+      - name: Create PR (merged case)
+        if: steps.merge_upstream.outputs.merged == 'true' && (steps.merge_predidit.outputs.pred_merged == 'true' || steps.merge_predidit.outputs.pred_merged == '')
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Automated: merge upstream/main and predidit/main"
+          title: "chore(sync): merge upstream + predidit into main"
+          body: |
+            This PR was created automatically by a workflow that merges the upstream `media-kit/media-kit` and `Predidit/media-kit` into this fork.
+
+            - If CI passes, maintainers can merge this PR.
+            - If there are conflicts in future runs, the workflow will open an issue to notify maintainers.
+          base: main
+
+      - name: Create issue for conflicts
+        if: steps.merge_upstream.outputs.merged == 'false' || steps.merge_predidit.outputs.pred_merged == 'false'
+        run: |
+          echo "Conflict detected while attempting to merge upstream and/or predidit. Creating an issue."
+          TITLE="Auto-sync conflict: $(date +"%Y-%m-%d %H:%M:%S")"
+          BODY="Automatic sync attempted but merge conflict occurred when merging \`upstream/main\` and/or \`predidit/main\` into this repository. Please merge manually or resolve conflicts.\n\nRemotes fetched: upstream=https://github.com/media-kit/media-kit.git predidit=https://github.com/Predidit/media-kit.git"
+          gh issue create --title "$TITLE" --body "$BODY" || echo "gh not available, skipping issue creation"
